@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.18.1](https://github.com/jdx/fnox/compare/v1.18.0..v1.18.1) - 2026-03-16
+
+### 📦️ Dependency Updates
+
+- lock file maintenance by [@renovate[bot]](https://github.com/renovate[bot]) in [#360](https://github.com/jdx/fnox/pull/360)
+- lock file maintenance by [@renovate[bot]](https://github.com/renovate[bot]) in [#362](https://github.com/jdx/fnox/pull/362)
+
 ## [1.18.0](https://github.com/jdx/fnox/compare/v1.17.0..v1.18.0) - 2026-03-13
 
 ### 🚀 Features
