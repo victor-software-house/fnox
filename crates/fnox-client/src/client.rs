@@ -119,7 +119,7 @@ impl Client {
             Response::UnsupportedProtocol { .. } => {
                 Err(CallError::Protocol("daemon does not accept this protocol"))
             }
-            Response::Error { message } => Err(CallError::Daemon(message)),
+            Response::Error { message, .. } => Err(CallError::Daemon(message)),
             _ => Err(CallError::Protocol("unexpected reply to hello")),
         }
     }
@@ -167,7 +167,9 @@ impl Client {
                 min: Some(min),
                 max: Some(max),
             },
-            Ok(Response::Error { message }) => EnvOutcome::Unavailable(CallError::Daemon(message)),
+            Ok(Response::Error { message, .. }) => {
+                EnvOutcome::Unavailable(CallError::Daemon(message))
+            }
             Ok(_) => {
                 EnvOutcome::Unavailable(CallError::Protocol("unexpected reply to resolve_env"))
             }

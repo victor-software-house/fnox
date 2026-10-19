@@ -6,10 +6,41 @@ use crate::providers::{ProviderConfig, get_provider_resolved};
 use crate::settings::Settings;
 use crate::source_registry;
 use crate::suggest::{find_similar, format_suggestions};
+use fnox_client::wire::{Diagnostic, DiagnosticLevel};
 use indexmap::IndexMap;
 use miette::SourceSpan;
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+
+tokio::task_local! {
+    static DIAGNOSTICS: RefCell<Vec<Diagnostic>>;
+}
+
+/// Runs `future`, keeping the if_missing warnings and errors it would log
+/// instead of logging them. The daemon has no terminal, so it sends them to
+/// the client to log.
+pub async fn capture_diagnostics<F: Future>(future: F) -> (F::Output, Vec<Diagnostic>) {
+    DIAGNOSTICS
+        .scope(RefCell::new(Vec::new()), async move {
+            let output = future.await;
+            (output, DIAGNOSTICS.with(RefCell::take))
+        })
+        .await
+}
+
+/// Keeps `message` when running under [`capture_diagnostics`], and returns
+/// whether it did, so the caller logs it otherwise.
+fn keep_diagnostic(level: DiagnosticLevel, message: &str) -> bool {
+    DIAGNOSTICS
+        .try_with(|diagnostics| {
+            diagnostics.borrow_mut().push(Diagnostic {
+                level,
+                message: message.to_string(),
+            });
+        })
+        .is_ok()
+}
 
 /// Extract a value from JSON using dot notation (e.g., "nested.path")
 /// Supports escaped dots: "foo\.bar" accesses the literal key "foo.bar"
@@ -417,18 +448,24 @@ pub fn handle_provider_error(
 ) -> Option<FnoxError> {
     match if_missing {
         IfMissing::Error => {
-            if use_tracing {
-                tracing::error!("Error resolving secret '{}': {}", key, error);
-            } else {
-                eprintln!("Error resolving secret '{}': {}", key, error);
+            let message = format!("Error resolving secret '{}': {}", key, error);
+            if !keep_diagnostic(DiagnosticLevel::Error, &message) {
+                if use_tracing {
+                    tracing::error!("{message}");
+                } else {
+                    eprintln!("{message}");
+                }
             }
             Some(error)
         }
         IfMissing::Warn => {
-            if use_tracing {
-                tracing::warn!("Error resolving secret '{}': {}", key, error);
-            } else {
-                eprintln!("Warning: Error resolving secret '{}': {}", key, error);
+            let message = format!("Error resolving secret '{}': {}", key, error);
+            if !keep_diagnostic(DiagnosticLevel::Warn, &message) {
+                if use_tracing {
+                    tracing::warn!("{message}");
+                } else {
+                    eprintln!("Warning: {message}");
+                }
             }
             None
         }
@@ -809,10 +846,10 @@ fn handle_missing_secret(
             key
         ))),
         IfMissing::Warn => {
-            eprintln!(
-                "Warning: Secret '{}' not found and no default provided",
-                key
-            );
+            let message = format!("Secret '{}' not found and no default provided", key);
+            if !keep_diagnostic(DiagnosticLevel::Warn, &message) {
+                eprintln!("Warning: {message}");
+            }
             Ok(None)
         }
         IfMissing::Ignore => Ok(None),

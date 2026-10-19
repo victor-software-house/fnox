@@ -141,11 +141,28 @@ pub struct ResolveEnvRequest {
     pub env: Vec<(String, String)>,
 }
 
+/// A warning or error the daemon logged while resolving. The daemon's own
+/// stderr goes nowhere, so it returns these for the client to log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub level: DiagnosticLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLevel {
+    Warn,
+    Error,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Resolved {
         values: IndexMap<String, Option<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diagnostics: Vec<Diagnostic>,
     },
     ResolveInForeground {
         fingerprint: String,
@@ -161,6 +178,8 @@ pub enum Response {
     Ok,
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diagnostics: Vec<Diagnostic>,
     },
     Hello {
         protocol: u32,
@@ -287,9 +306,13 @@ impl fmt::Debug for Request {
 impl fmt::Debug for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Resolved { values } => f
+            Self::Resolved {
+                values,
+                diagnostics,
+            } => f
                 .debug_struct("Resolved")
                 .field("values", &KeysOf(values))
+                .field("diagnostics", diagnostics)
                 .finish(),
             Self::ResolveInForeground {
                 fingerprint,
@@ -312,7 +335,14 @@ impl fmt::Debug for Response {
                 .field("cached_entries", cached_entries)
                 .finish(),
             Self::Ok => f.write_str("Ok"),
-            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+            Self::Error {
+                message,
+                diagnostics,
+            } => f
+                .debug_struct("Error")
+                .field("message", message)
+                .field("diagnostics", diagnostics)
+                .finish(),
             Self::Hello {
                 protocol,
                 min_protocol,
@@ -643,6 +673,16 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_response_shapes() {
+        round_trip_response(
+            r#"{"status":"resolved","values":{"A":null},"diagnostics":[{"level":"warn","message":"Error resolving secret 'A': gone"}]}"#,
+        );
+        round_trip_response(
+            r#"{"status":"error","message":"gone","diagnostics":[{"level":"error","message":"Error resolving secret 'A': gone"}]}"#,
+        );
+    }
+
+    #[test]
     fn env_rejected_decodes_with_absent_fields() {
         let Response::EnvRejected(rejection) =
             serde_json::from_str(r#"{"status":"env_rejected","unknown":["U"]}"#).unwrap()
@@ -710,7 +750,13 @@ mod tests {
                     env: vec![("TOKEN".to_string(), "s3cr3t".to_string())],
                 })
             ),
-            format!("{:?}", Response::Resolved { values: values() }),
+            format!(
+                "{:?}",
+                Response::Resolved {
+                    values: values(),
+                    diagnostics: Vec::new(),
+                }
+            ),
             format!(
                 "{:?}",
                 Response::ResolveInForeground {

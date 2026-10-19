@@ -2,14 +2,16 @@ use crate::child_env;
 use crate::commands::Cli;
 use crate::config::{Config, ProviderConfig, SecretConfig};
 use crate::error::{FnoxError, Result};
-use crate::secret_resolver::{resolve_secrets_batch, resolve_secrets_batch_with_pre_resolved};
+use crate::secret_resolver::{
+    capture_diagnostics, resolve_secrets_batch, resolve_secrets_batch_with_pre_resolved,
+};
 use fnox_client::path::{RuntimeEnv, SocketKey};
 #[cfg(any(unix, windows))]
 use fnox_client::wire::MAX_LINE_BYTES;
 pub use fnox_client::wire::Purpose;
 use fnox_client::wire::{
-    CallError, Request, ResolveBatchRequest, ResolveEnvRequest, ResolveOneRequest, Response,
-    StoreResolvedRequest,
+    CallError, Diagnostic, DiagnosticLevel, Request, ResolveBatchRequest, ResolveEnvRequest,
+    ResolveOneRequest, Response, StoreResolvedRequest,
 };
 use fnox_client::{MIN_PROTOCOL, WIRE_VERSION, daemon_env_override, platform_supported};
 use indexmap::IndexMap;
@@ -92,6 +94,21 @@ impl ResolveContext {
 /// What a failed call to the daemon says, in fnox's own error type.
 fn into_fnox_error(error: CallError) -> FnoxError {
     FnoxError::Config(error.to_string())
+}
+
+/// Logs what the daemon kept while resolving, as the resolver logs it when it
+/// runs in this process.
+fn log_diagnostics(diagnostics: Vec<Diagnostic>) {
+    for diagnostic in diagnostics {
+        match diagnostic.level {
+            DiagnosticLevel::Warn => {
+                tracing::warn!(target: "fnox_core::secret_resolver", "{}", diagnostic.message);
+            }
+            DiagnosticLevel::Error => {
+                tracing::error!(target: "fnox_core::secret_resolver", "{}", diagnostic.message);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -198,7 +215,13 @@ pub async fn resolve_batch_with_context(
     };
 
     match call_or_start(ctx, config, Request::ResolveBatch(batch_request.clone())).await? {
-        Response::Resolved { values } => Ok(values),
+        Response::Resolved {
+            values,
+            diagnostics,
+        } => {
+            log_diagnostics(diagnostics);
+            Ok(values)
+        }
         Response::ResolveInForeground {
             fingerprint,
             mut cached_values,
@@ -249,7 +272,13 @@ pub async fn resolve_batch_with_context(
             }
             Ok(values)
         }
-        Response::Error { message } => Err(FnoxError::Config(message)),
+        Response::Error {
+            message,
+            diagnostics,
+        } => {
+            log_diagnostics(diagnostics);
+            Err(FnoxError::Config(message))
+        }
         _ => Err(FnoxError::Config(
             "Invalid daemon response for ResolveBatch".to_string(),
         )),
@@ -302,7 +331,13 @@ pub async fn resolve_one_with_context(
     };
 
     match call_or_start(ctx, config, Request::ResolveOne(one_request.clone())).await? {
-        Response::Resolved { mut values } => Ok(values.swap_remove(key).flatten()),
+        Response::Resolved {
+            mut values,
+            diagnostics,
+        } => {
+            log_diagnostics(diagnostics);
+            Ok(values.swap_remove(key).flatten())
+        }
         Response::ResolveInForeground {
             fingerprint, epoch, ..
         } => {
@@ -330,7 +365,13 @@ pub async fn resolve_one_with_context(
             }
             Ok(value)
         }
-        Response::Error { message } => Err(FnoxError::Config(message)),
+        Response::Error {
+            message,
+            diagnostics,
+        } => {
+            log_diagnostics(diagnostics);
+            Err(FnoxError::Config(message))
+        }
         _ => Err(FnoxError::Config(
             "Invalid daemon response for ResolveOne".to_string(),
         )),
@@ -358,7 +399,7 @@ async fn store_foreground_values(
     .await?
     {
         Response::Ok => Ok(()),
-        Response::Error { message } => Err(FnoxError::Config(message)),
+        Response::Error { message, .. } => Err(FnoxError::Config(message)),
         _ => Err(FnoxError::Config(
             "Invalid daemon response for StoreResolved".to_string(),
         )),
@@ -375,7 +416,7 @@ async fn status_for_context(ctx: &ResolveContext) -> Result<Option<(u32, usize)>
             pid,
             cached_entries,
         }) => Ok(Some((pid, cached_entries))),
-        Ok(Response::Error { message }) => Err(FnoxError::Config(message)),
+        Ok(Response::Error { message, .. }) => Err(FnoxError::Config(message)),
         Ok(_) => Err(FnoxError::Config(
             "Invalid daemon response for Status".to_string(),
         )),
@@ -427,7 +468,7 @@ async fn clear_socket(path: PathBuf, keys: &[String], ignore_missing: bool) -> R
     };
     match call(path.clone(), request).await {
         Ok(Response::Ok) => Ok(true),
-        Ok(Response::Error { message }) => Err(FnoxError::Config(message)),
+        Ok(Response::Error { message, .. }) => Err(FnoxError::Config(message)),
         Ok(_) => Err(FnoxError::Config(
             "Invalid daemon response for Clear".to_string(),
         )),
@@ -455,7 +496,7 @@ fn daemon_socket_paths() -> Result<Vec<PathBuf>> {
 pub async fn shutdown(cli: &Cli) -> Result<()> {
     match call(socket_path(cli)?, Request::Shutdown).await {
         Ok(Response::Ok) => Ok(()),
-        Ok(Response::Error { message }) => Err(FnoxError::Config(message)),
+        Ok(Response::Error { message, .. }) => Err(FnoxError::Config(message)),
         Ok(_) => Err(FnoxError::Config(
             "Invalid daemon response for Shutdown".to_string(),
         )),
@@ -962,10 +1003,17 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|e| FnoxError::Config(format!("Failed to decode daemon request: {e}")))?;
 
     let shutdown = matches!(request, Request::Shutdown);
-    let response = match process_request(request, state, request_lock).await {
+    let (response, diagnostics) =
+        capture_diagnostics(process_request(request, state, request_lock)).await;
+    let response = match response {
+        Ok(Response::Resolved { values, .. }) => Response::Resolved {
+            values,
+            diagnostics,
+        },
         Ok(response) => response,
         Err(e) => Response::Error {
             message: e.to_string(),
+            diagnostics,
         },
     };
     let mut stream = reader.into_inner();
@@ -1112,7 +1160,10 @@ async fn process_request(
                 });
             }
             let values = resolve_with_cache(&config, &req.profile, secrets, &req, state).await?;
-            Ok(Response::Resolved { values })
+            Ok(Response::Resolved {
+                values,
+                diagnostics: Vec::new(),
+            })
         }
         Request::ResolveOne(req) => {
             let _guard = request_lock.lock().await;
@@ -1129,6 +1180,7 @@ async fn process_request(
             let Some(secret_config) = config.get_secret(&req.profile, &req.key)?.cloned() else {
                 return Ok(Response::Resolved {
                     values: [(req.key, None)].into_iter().collect(),
+                    diagnostics: Vec::new(),
                 });
             };
             let batch_req = ResolveBatchRequest {
@@ -1163,7 +1215,10 @@ async fn process_request(
             }
             let values =
                 resolve_with_cache(&config, &batch_req.profile, secrets, &batch_req, state).await?;
-            Ok(Response::Resolved { values })
+            Ok(Response::Resolved {
+                values,
+                diagnostics: Vec::new(),
+            })
         }
     }
 }
