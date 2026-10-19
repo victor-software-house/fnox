@@ -1524,6 +1524,10 @@
         "idle_timeout": {
           "description": "Idle timeout before the daemon exits, such as \"8h\", \"30m\", or \"300s\".",
           "type": ["string", "null"]
+        },
+        "max_age": {
+          "description": "How long a cached value is served before it is read from its provider\nagain, such as \"1h\". Unset, a value stays cached until the daemon exits.",
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false

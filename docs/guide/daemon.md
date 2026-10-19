@@ -33,9 +33,18 @@ fnox daemon clear API_TOKEN                # just evict it
 fnox daemon clear                          # evict everything
 ```
 
+Each request resets the idle timer, so a daemon in steady use keeps serving a value until you refresh it. To re-read values on a schedule, set `max_age`:
+
+```toml
+[daemon]
+enabled = true
+max_age = "1h" # a cached value is read again after an hour
+```
+
 The cache is also dropped automatically when:
 
 - the daemon stops, or exits after `idle_timeout` with no requests;
+- a cached value is older than `max_age`;
 - a config file, the selected profile, a provider setting, or a relevant `FNOX_*` or provider credential variable (such as `AWS_*`) changes.
 
 ## What uses it

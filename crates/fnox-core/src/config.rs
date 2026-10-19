@@ -440,6 +440,11 @@ pub struct DaemonConfig {
     /// Idle timeout before the daemon exits, such as "8h", "30m", or "300s".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<String>,
+
+    /// How long a cached value is served before it is read from its provider
+    /// again, such as "1h". Unset, a value stays cached until the daemon exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<String>,
 }
 
 /// Credential proxy configuration.
@@ -1143,6 +1148,9 @@ impl Config {
             }
             if overlay_daemon.idle_timeout.is_some() {
                 base_daemon.idle_timeout = overlay_daemon.idle_timeout;
+            }
+            if overlay_daemon.max_age.is_some() {
+                base_daemon.max_age = overlay_daemon.max_age;
             }
         }
 

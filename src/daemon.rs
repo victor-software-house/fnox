@@ -20,7 +20,7 @@ use std::os::fd::AsRawFd;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(windows)]
@@ -101,10 +101,25 @@ struct CacheKey {
     hash: String,
 }
 
+struct CacheEntry {
+    value: Option<String>,
+    /// When the value was read from its provider, for `daemon.max_age`.
+    stored_at: Instant,
+}
+
+impl CacheEntry {
+    fn new(value: Option<String>) -> Self {
+        Self {
+            value,
+            stored_at: Instant::now(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct DaemonState {
     // Missing values are not cache hits: a provider may recover between requests.
-    cache: HashMap<CacheKey, Option<String>>,
+    cache: HashMap<CacheKey, CacheEntry>,
     /// Incremented on every clear. A foreground resolution records the epoch it
     /// started at so its write-back can be rejected for keys cleared meanwhile.
     epoch: u64,
@@ -128,6 +143,21 @@ impl DaemonState {
             for key in keys {
                 self.key_clear_epochs.insert(key, self.epoch);
             }
+        }
+    }
+
+    /// Clears the secrets that have an entry older than `max_age`. A clear,
+    /// rather than a plain removal, so a foreground client that read one of
+    /// them before it expired cannot write it back.
+    fn expire(&mut self, max_age: Duration) {
+        let expired = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| entry.stored_at.elapsed() >= max_age)
+            .map(|(cache_key, _)| cache_key.secret.clone())
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            self.clear(expired);
         }
     }
 
@@ -1020,6 +1050,7 @@ async fn process_request(
             // As `fnox env` does, so an unknown profile is an error here and
             // the CLI fallback reports it, rather than an empty hit.
             config.validate_profiles(&req.profile, None)?;
+            expire_entries(&config, &state).await?;
             let env_override = daemon_env_override(&|k| crate::env::var(k).ok());
             resolve_env_response(&config, &req, env_override, &state).await
         }
@@ -1092,6 +1123,7 @@ async fn process_request(
                 req.non_interactive,
             );
             let config = Config::load_smart(&req.config)?;
+            expire_entries(&config, &state).await?;
             let all_secrets = config.get_secrets(&req.profile)?;
             let requested = req.keys.iter().cloned().collect::<HashSet<_>>();
             let secrets: IndexMap<String, SecretConfig> = all_secrets
@@ -1126,6 +1158,7 @@ async fn process_request(
                 req.non_interactive,
             );
             let config = Config::load_smart(&req.config)?;
+            expire_entries(&config, &state).await?;
             let Some(secret_config) = config.get_secret(&req.profile, &req.key)?.cloned() else {
                 return Ok(Response::Resolved {
                     values: [(req.key, None)].into_iter().collect(),
@@ -1166,6 +1199,17 @@ async fn process_request(
             Ok(Response::Resolved { values })
         }
     }
+}
+
+/// Applies the requesting config's `daemon.max_age`, if it sets one. Each
+/// request applies its own, so an entry never outlives the limit of the
+/// config that reads it.
+async fn expire_entries(config: &Config, state: &Mutex<DaemonState>) -> Result<()> {
+    if let Some(max_age) = config.daemon.as_ref().and_then(|d| d.max_age.as_deref()) {
+        let max_age = parse_duration(max_age)?;
+        state.lock().await.expire(max_age);
+    }
+    Ok(())
 }
 
 fn protocol_supported(protocol: u32) -> bool {
@@ -1250,7 +1294,10 @@ async fn resolve_env_response(
                     req.no_defaults,
                     purpose,
                 );
-                state.cache.get(&cache_key).cloned().flatten()
+                state
+                    .cache
+                    .get(&cache_key)
+                    .and_then(|entry| entry.value.clone())
             });
             match cached {
                 Some(value) => {
@@ -1315,7 +1362,9 @@ async fn foreground_resolution_if_needed(
     let mut keys = Vec::new();
     for (key, secret) in secrets {
         if secret_is_cacheable(&providers, default_provider, secret, &req.purpose)
-            && let Some(Some(value)) = state.cache.get(&cache_key(
+            && let Some(CacheEntry {
+                value: Some(value), ..
+            }) = state.cache.get(&cache_key(
                 &fingerprint,
                 profile,
                 key,
@@ -1377,7 +1426,15 @@ async fn store_resolved_values(
                 req.no_defaults,
                 &req.purpose,
             );
-            state.cache.insert(cache_key, Some(value));
+            // The client sends back the values it got from the cache too. Keep
+            // their age, or every foreground resolution would renew them.
+            if state
+                .cache
+                .get(&cache_key)
+                .is_none_or(|entry| entry.value.as_ref() != Some(&value))
+            {
+                state.cache.insert(cache_key, CacheEntry::new(Some(value)));
+            }
         }
     }
     Ok(())
@@ -1427,7 +1484,10 @@ async fn resolve_with_cache(
                     req.no_defaults,
                     &req.purpose,
                 );
-                if let Some(Some(value)) = state.cache.get(&cache_key) {
+                if let Some(CacheEntry {
+                    value: Some(value), ..
+                }) = state.cache.get(&cache_key)
+                {
                     results.insert(key.clone(), Some(value.clone()));
                     continue;
                 }
@@ -1445,7 +1505,9 @@ async fn resolve_with_cache(
             if let Some(cache_key) = miss_keys.remove(&key)
                 && value.is_some()
             {
-                state.cache.insert(cache_key, value.clone());
+                state
+                    .cache
+                    .insert(cache_key, CacheEntry::new(value.clone()));
             }
             results.insert(key, value);
         }
@@ -1817,7 +1879,7 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheKey, DaemonState, Purpose, Request, ResolveBatchRequest, ResolveContext,
+        CacheEntry, CacheKey, DaemonState, Purpose, Request, ResolveBatchRequest, ResolveContext,
         ResolveEnvRequest, Response, cache_key, config_fingerprint,
         foreground_resolution_if_needed, parse_duration, process_request, resolve_env_response,
         resolve_with_cache, store_resolved_values,
@@ -1826,6 +1888,7 @@ mod tests {
     use fnox_client::path::RuntimeEnv;
     use fnox_core::config::{Config, ProviderConfig, SecretConfig};
     use indexmap::IndexMap;
+    use std::time::{Duration, Instant};
     use std::{path::PathBuf, sync::Arc};
     use tokio::sync::Mutex;
 
@@ -2547,6 +2610,58 @@ NOCACHE = { provider = "plain", value = "nc", daemon_cache = false }
         );
     }
 
+    fn two_minutes_ago() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn max_age_clears_only_old_entries() {
+        let config = env_config(ENV_CONFIG);
+        let state = seed(&config, "exec", &[("FOO", "foo"), ("BAR", "bar")]).await;
+        let mut state = state.lock().await;
+        let epoch = state.epoch;
+        for (cache_key, entry) in &mut state.cache {
+            if cache_key.secret == "FOO" {
+                entry.stored_at = two_minutes_ago();
+            }
+        }
+        state.expire(Duration::from_secs(60));
+        let cached = state
+            .cache
+            .keys()
+            .map(|cache_key| cache_key.secret.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(cached, ["BAR"]);
+        // A foreground client that read FOO before it expired cannot store it back.
+        assert!(state.cleared_since("FOO", epoch));
+        assert!(!state.cleared_since("BAR", epoch));
+    }
+
+    #[tokio::test]
+    async fn write_back_keeps_the_age_of_an_unchanged_value() {
+        let config = env_config(ENV_CONFIG);
+        let state = seed(&config, "exec", &[("FOO", "foo")]).await;
+        let old = two_minutes_ago();
+        for entry in state.lock().await.cache.values_mut() {
+            entry.stored_at = old;
+        }
+
+        seed_into(&state, &config, "exec", &[("FOO", "foo")]).await;
+        assert!(
+            state
+                .lock()
+                .await
+                .cache
+                .values()
+                .all(|e| e.stored_at == old)
+        );
+
+        seed_into(&state, &config, "exec", &[("FOO", "rotated")]).await;
+        assert!(state.lock().await.cache.values().all(|e| e.stored_at > old));
+    }
+
     #[tokio::test]
     async fn resolve_env_reports_only_the_uncached_roots() {
         let config = env_config(ENV_CONFIG);
@@ -2574,7 +2689,7 @@ NOCACHE = { provider = "plain", value = "nc", daemon_cache = false }
                 false,
                 "exec",
             ),
-            Some("nc".to_string()),
+            CacheEntry::new(Some("nc".to_string())),
         );
         let req = env_request(EnvScope::Exec, Some(&["NOCACHE"]));
         let Response::EnvMiss { keys } = respond(&config, &req, None, &state).await else {
