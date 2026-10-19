@@ -1904,7 +1904,7 @@ mod tests {
         let secret = plain_secret("value");
         let req = test_batch_request();
         let fingerprint = config_fingerprint(&config, &req.env).unwrap();
-        let mut cache = std::collections::HashMap::<CacheKey, Option<String>>::new();
+        let mut cache = std::collections::HashMap::<CacheKey, CacheEntry>::new();
         for key in ["API_KEY", "OTHER_KEY"] {
             cache.insert(
                 cache_key(
@@ -1915,7 +1915,7 @@ mod tests {
                     req.no_defaults,
                     &req.purpose,
                 ),
-                Some("cached".to_string()),
+                CacheEntry::new(Some("cached".to_string())),
             );
         }
         let state = Arc::new(Mutex::new(DaemonState {
@@ -2047,8 +2047,8 @@ mod tests {
             req.no_defaults,
             &req.purpose,
         );
-        let mut cache = std::collections::HashMap::<CacheKey, Option<String>>::new();
-        cache.insert(key, Some("cached".to_string()));
+        let mut cache = std::collections::HashMap::<CacheKey, CacheEntry>::new();
+        cache.insert(key, CacheEntry::new(Some("cached".to_string())));
         Arc::new(Mutex::new(DaemonState {
             cache,
             ..Default::default()
