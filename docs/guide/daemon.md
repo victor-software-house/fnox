@@ -46,7 +46,7 @@ Commands that write or administer (`set`, `remove`, `sync`, `reencrypt`, `edit`,
 
 ## Prompts and hardware keys
 
-On a cache miss, fnox resolves the secret in your terminal and hands the result to the daemon. That way 1Password or SSO prompts, FIDO2 PINs, and YubiKey touches happen where you can see them. With `--non-interactive`, misses are resolved inside the daemon and never prompt.
+On a cache miss, fnox resolves the secret in your terminal and hands the result to the daemon. That way 1Password or SSO prompts, FIDO2 PINs, and YubiKey touches happen where you can see them. With `--non-interactive`, misses are resolved inside the daemon and never prompt; the daemon returns any `if_missing` warnings and errors to the command, which prints them as it would without the daemon.
 
 ## Exclude a secret or provider
 

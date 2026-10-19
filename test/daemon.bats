@@ -12,6 +12,7 @@ teardown() {
 	"$FNOX_BIN" --profile dev daemon stop >/dev/null 2>&1 || true
 	"$FNOX_BIN" --profile staging daemon stop >/dev/null 2>&1 || true
 	"$FNOX_BIN" --profile staging --no-defaults daemon stop >/dev/null 2>&1 || true
+	"$FNOX_BIN" --if-missing error daemon stop >/dev/null 2>&1 || true
 	_common_teardown
 }
 
@@ -105,6 +106,51 @@ EOF
 	assert_success
 	assert_output "foreground-value"
 	assert_equal "$(wc -l <"$PASS_PPID_FILE" | tr -d ' ')" "1"
+}
+
+failing_pass_config() {
+	mkdir -p "$TEST_TEMP_DIR/bin"
+	cat >"$TEST_TEMP_DIR/bin/pass" <<'EOF'
+#!/bin/sh
+echo "Error: $2 is not in the password store." >&2
+exit 1
+EOF
+	chmod +x "$TEST_TEMP_DIR/bin/pass"
+	export PATH="$TEST_TEMP_DIR/bin:$PATH"
+
+	cat >fnox.toml <<'EOF'
+root = true
+
+[daemon]
+enabled = true
+
+[providers.plain]
+type = "plain"
+
+[providers.pass]
+type = "password-store"
+
+[secrets]
+FOO = { provider = "plain", value = "bar" }
+GONE = { provider = "pass", value = "gone" }
+EOF
+}
+
+@test "daemon returns if_missing warnings to a non-interactive client" {
+	failing_pass_config
+
+	run "$FNOX_BIN" --non-interactive export
+	assert_success
+	assert_output --partial "Error resolving secret 'GONE'"
+	assert_output --partial "FOO"
+}
+
+@test "daemon returns if_missing errors to a non-interactive client" {
+	failing_pass_config
+
+	run "$FNOX_BIN" --non-interactive --if-missing error export
+	assert_failure
+	assert_output --partial "Error resolving secret 'GONE'"
 }
 
 @test "daemon cache hits satisfy provider dependencies without exposing unrelated secrets" {

@@ -241,7 +241,7 @@ fn an_undeclared_profile_is_an_error_not_a_hit() {
     )
     .unwrap();
     assert!(
-        matches!(&response, Response::Error { message } if message.contains("nope")),
+        matches!(&response, Response::Error { message, .. } if message.contains("nope")),
         "{response:?}"
     );
 }
