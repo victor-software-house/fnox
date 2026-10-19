@@ -366,12 +366,14 @@ Maps a plugin name to its git source. A source is a git URL, optionally followed
 [daemon]
 enabled = true
 idle_timeout = "8h"
+max_age = "1h"
 ```
 
 | Field          | Type     | Default | Description                                                              |
 | -------------- | -------- | ------- | ------------------------------------------------------------------------ |
 | `enabled`      | boolean  | `false` | Resolve secrets through the per-user daemon. `FNOX_DAEMON` overrides it. |
 | `idle_timeout` | duration | `"8h"`  | How long the daemon runs without requests before it exits.               |
+| `max_age`      | duration | none    | How long a cached value is served before it is read again.               |
 
 See [daemon](/guide/daemon).
 

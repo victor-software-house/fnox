@@ -278,6 +278,23 @@ rotate_both() {
 	assert_output "new-token old-other"
 }
 
+@test "max_age re-reads a cached value once it is older" {
+	rotating_config
+	awk '{ print } /^enabled = true$/ { print "max_age = \"1s\"" }' fnox.toml >fnox.toml.new
+	mv fnox.toml.new fnox.toml
+
+	run "$FNOX_BIN" get TOKEN
+	assert_success
+	assert_output "old-token"
+
+	rotate_both
+	sleep 2
+
+	run "$FNOX_BIN" get TOKEN
+	assert_success
+	assert_output "new-token"
+}
+
 @test "get --refresh re-resolves one secret and caches the new value" {
 	rotating_config
 
